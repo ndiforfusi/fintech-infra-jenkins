@@ -1,5 +1,5 @@
 pipeline {
-  agent { label 'linux && docker' } // adjust as needed
+  agent any // adjust as needed
 
   /* ---- Parameters (runtime overrides) ---- */
   parameters {
