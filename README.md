@@ -19,9 +19,9 @@ It supports **multi-environment deployments (dev, qa, uat, prod)**, integrates *
 ```text
 SCM Change ─▶ Checkout ─▶ Fmt/Validate ─▶ Plan + Archive ─▶ Manual Gate ─▶ Apply/Destroy
                  (Branch)     (TF 1.5.x)       (plan.tfplan)      (Approval)      (Safe Apply)
+
+
 📁 2. Repository Layout
-r
-Copy code
 .
 ├── Jenkinsfile                    # CI/CD pipeline definition
 ├── dev/
@@ -31,6 +31,7 @@ Copy code
 ├── uat/
 └── prod/
 Each environment folder corresponds to its own Terraform root and backend key.
+
 
 ⚙️ 3. Jenkins Requirements
 🧩 Required Plugins
@@ -55,12 +56,12 @@ Git, bash/sh
 
 (Optional) Docker if containerized builds are preferred
 
+
 🔐 4. AWS Authentication Options
 🅰️ Option A — AssumeRole (Recommended)
 Leverages AWS STS to assume a temporary role in the target account.
 
-groovy
-Copy code
+
 withAWS(region: params.REGION, role: params.ASSUME_ROLE_ARN, duration: 3600) {
   sh '''
     terraform init -upgrade -backend-config="key=${params.ENVIRONMENT}/terraform.tfstate"
@@ -72,8 +73,7 @@ withAWS(region: params.REGION, role: params.ASSUME_ROLE_ARN, duration: 3600) {
 Base IAM Role/User (Jenkins)
 Grants permission to assume the target Terraform role:
 
-json
-Copy code
+
 {
   "Version": "2012-10-17",
   "Statement": [{
@@ -84,8 +84,7 @@ Copy code
 }
 Target Role (TerraformDeployRole) — Trust Policy
 
-json
-Copy code
+
 {
   "Version": "2012-10-17",
   "Statement": [{
@@ -98,8 +97,7 @@ Copy code
 }
 TerraformDeployRole Permissions Example
 
-json
-Copy code
+
 {
   "Effect": "Allow",
   "Action": [
@@ -282,6 +280,7 @@ PR triggered apply	Review when conditions in pipeline
  Approval gate visible for apply/destroy
 
  Apply/Destroy succeeds per environment
+
 
 🧾 15. References
 Terraform Docs
