@@ -1,37 +1,40 @@
 pipeline {
-  agent any // adjust as needed
+  agent any
 
-  /* ---- Parameters (runtime overrides) ---- */
+  /* ---------- Parameters ---------- */
   parameters {
     choice(name: 'ENVIRONMENT', choices: ['dev', 'qa', 'uat', 'prod'], description: 'Deployment Environment')
-    string(name: 'REGION', defaultValue: 'us-east-2', description: 'AWS Region')
+    string(name: 'REGION', defaultValue: 'us-west-2', description: 'AWS Region')
     choice(name: 'ACTION', choices: ['apply', 'destroy'], description: 'Terraform action')
-    // Optional: if you prefer assuming a role instead of static keys, set a role ARN here and configure AWS Steps plugin.
-    string(name: 'ASSUME_ROLE_ARN', defaultValue: 'arn:aws:iam::327019199684:role/jenkins-ssm-role', description: 'Optional: STS role ARN to assume (leave blank to use static AWS creds)')
+
+    // IMPORTANT: This must be the *deploy* role (e.g., TerraformDeployRole), not your instance profile/base role.
+    // You may leave this blank and set TERRAFORM_DEPLOY_ROLE_ARN as a global env var in Jenkins System Settings.
+    string(
+      name: 'ASSUME_ROLE_ARN',
+      defaultValue: 'arn:aws:iam::327019199684:role/TerraformDeployRole',
+      description: 'STS role ARN to assume for Terraform (deploy role, not base role)'
+    )
   }
 
-  /* ---- Global env ---- */
+  /* ---------- Global env ---------- */
   environment {
-    TF_ENV      = "${params.ENVIRONMENT}"
-    AWS_REGION  = "${params.REGION}"
-    TF_DIR      = "${params.ENVIRONMENT}"   // matches your per-env folder layout
-    TF_INPUT    = 'false'
-    TF_IN_AUTOMATION = 'true'
-    // If you’ve configured a Jenkins tool named "terraform-1.5.0" under Manage Jenkins » Global Tool Configuration:
-    // PATH = "${tool 'terraform-1.5.0'}/bin:${env.PATH}"
+    TF_ENV            = "${params.ENVIRONMENT}"
+    AWS_REGION        = "${params.REGION}"
+    TF_DIR            = "${params.ENVIRONMENT}"  // folder per env (dev/qa/uat/prod)
+    TF_INPUT          = 'false'
+    TF_IN_AUTOMATION  = 'true'
+    // If you configure a Jenkins tool named "terraform-1.13.4":
+    // PATH = "${tool 'terraform-1.13.4'}/bin:${env.PATH}"
   }
 
-  /* ---- Pipeline options & concurrency ---- */
+  /* ---------- Options ---------- */
   options {
-    disableConcurrentBuilds()           // mirrors GH Actions concurrency group
+    disableConcurrentBuilds()
     buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '30'))
     timestamps()
     ansiColor('xterm')
-    timeout(time: 60, unit: 'MINUTES')  // end-to-end safety timeout
+    timeout(time: 60, unit: 'MINUTES')
   }
-
-  /* ---- Triggers (optional; Multibranch typically handles via webhooks) ---- */
-  // triggers { pollSCM('@daily') }
 
   stages {
 
@@ -55,8 +58,13 @@ pipeline {
 
     stage('Terraform Setup') {
       steps {
-        // Prefer preinstalled terraform via Jenkins tool (PATH set above) or tfenv in your agents.
         sh 'terraform version || true'
+      }
+    }
+
+    stage('WhoAmI (before assume)') {
+      steps {
+        sh 'aws sts get-caller-identity || true'
       }
     }
 
@@ -73,12 +81,15 @@ pipeline {
 
     stage('Terraform Plan') {
       steps {
-        withAwsOrStaticCreds(AWS_REGION, params.ASSUME_ROLE_ARN) {
-          sh """
-            cd "${TF_DIR}"
-            terraform plan -lock=false -out plan.tfplan
-            terraform show -no-color plan.tfplan > plan.txt
-          """
+        script {
+          def roleArn = chooseRoleArn(params.ASSUME_ROLE_ARN)
+          withAssumedRole(AWS_REGION, roleArn) {
+            sh """
+              cd "${TF_DIR}"
+              terraform plan -lock=false -out plan.tfplan
+              terraform show -no-color plan.tfplan > plan.txt
+            """
+          }
         }
         archiveArtifacts artifacts: "${TF_DIR}/plan.tfplan, ${TF_DIR}/plan.txt", fingerprint: true
         stash name: 'tf-plan-bundle', includes: "${TF_DIR}/plan.tfplan, ${TF_DIR}/plan.txt"
@@ -88,7 +99,6 @@ pipeline {
     stage('Approval Gate') {
       when {
         anyOf {
-          // Require manual approval for changes into release branch, or anytime ACTION==apply on mainline.
           branch 'release'
           allOf { not { changeRequest() }; expression { params.ACTION == 'apply' } }
         }
@@ -106,13 +116,16 @@ pipeline {
     stage('Terraform Apply') {
       when { expression { params.ACTION == 'apply' } }
       steps {
-        unstash 'tf-plan-bundle'
-        withAwsOrStaticCreds(AWS_REGION, params.ASSUME_ROLE_ARN) {
-          sh """
-            cd "${TF_DIR}"
-            terraform init -backend-config="key=${TF_ENV}/terraform.tfstate"
-            terraform apply -auto-approve -lock=false plan.tfplan
-          """
+        script {
+          def roleArn = chooseRoleArn(params.ASSUME_ROLE_ARN)
+          unstash 'tf-plan-bundle'
+          withAssumedRole(AWS_REGION, roleArn) {
+            sh """
+              cd "${TF_DIR}"
+              terraform init -backend-config="key=${TF_ENV}/terraform.tfstate"
+              terraform apply -auto-approve -lock=false plan.tfplan
+            """
+          }
         }
       }
     }
@@ -120,12 +133,26 @@ pipeline {
     stage('Terraform Destroy') {
       when { expression { params.ACTION == 'destroy' } }
       steps {
-        withAwsOrStaticCreds(AWS_REGION, params.ASSUME_ROLE_ARN) {
-          sh """
-            cd "${TF_DIR}"
-            terraform init -backend-config="key=${TF_ENV}/terraform.tfstate"
-            terraform destroy -auto-approve -lock=false
-          """
+        script {
+          def roleArn = chooseRoleArn(params.ASSUME_ROLE_ARN)
+          withAssumedRole(AWS_REGION, roleArn) {
+            sh """
+              cd "${TF_DIR}"
+              terraform init -backend-config="key=${TF_ENV}/terraform.tfstate"
+              terraform destroy -auto-approve -lock=false
+            """
+          }
+        }
+      }
+    }
+
+    stage('WhoAmI (after assume)') {
+      steps {
+        script {
+          def roleArn = chooseRoleArn(params.ASSUME_ROLE_ARN)
+          withAssumedRole(AWS_REGION, roleArn) {
+            sh 'aws sts get-caller-identity'
+          }
         }
       }
     }
@@ -144,19 +171,22 @@ pipeline {
   }
 }
 
-/* =======================
-   Shared helper for creds
-   ======================= */
-def withAwsOrStaticCreds(String region, String roleArn, Closure body) {
-  // Option A (recommended): AssumeRole via AWS Steps plugin if ASSUME_ROLE_ARN provided.
-  if (roleArn?.trim()) {
-    withAWS(region: region, role: roleArn, duration: 3600) { body() }
-    return
-  }
+/* =======================================================================
+   Helpers: force AssumeRole (no static fallback) + role selection
+   ======================================================================= */
 
-  // Option B (static keys): Bind a Jenkins credential (type "AWS Credentials") with ID 'aws-static-creds'.
-  // Create it in Jenkins » Manage Credentials. This mirrors GitHub secrets usage.
-  withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-static-creds']]) {
-    withEnv(["AWS_REGION=${region}"]) { body() }
+def chooseRoleArn(String paramArn) {
+  def arn = (paramArn?.trim()) ? paramArn.trim() : (env.TERRAFORM_DEPLOY_ROLE_ARN ?: '').trim()
+  if (!arn) {
+    error """No deploy role ARN provided.
+- Set the pipeline parameter ASSUME_ROLE_ARN, or
+- Configure a global env var TERRAFORM_DEPLOY_ROLE_ARN in Jenkins System Settings."""
   }
+  echo "Using deploy role ARN: ${arn}"
+  return arn
+}
+
+def withAssumedRole(String region, String roleArn, Closure body) {
+  // Requires the AWS Steps plugin
+  withAWS(region: region, role: roleArn, duration: 3600) { body() }
 }
