@@ -1,129 +1,151 @@
-# fintech-infra-jenkins
-This guide explains how to implement, run, and maintain the Jenkins-based CI/CD pipeline that replaces your GitHub Actions workflow for Terraform infrastructure deployments.
+# 🚀 **Fintech Infrastructure – Jenkins CI/CD for Terraform**
 
-1) Overview
+This repository provides a **Jenkins-based CI/CD pipeline** to deploy Terraform infrastructure, replacing the legacy **GitHub Actions** workflow.  
+It supports **multi-environment deployments (dev, qa, uat, prod)**, integrates **AWS AssumeRole** or **static credentials**, and ensures **secure, auditable, and automated** provisioning.
 
-What it does
+---
 
-Validates Terraform (fmt/validate)
+## 🧭 **1. Overview**
 
-Plans with per-environment backend state key
+### 🧩 **What It Does**
+- ✅ Validates Terraform (`fmt`, `validate`)
+- ✅ Runs plan and stores outputs as artifacts
+- ✅ Supports manual approval gates before apply/destroy
+- ✅ Handles per-environment state backends
+- ✅ Supports both AssumeRole and static key authentication
 
-Stores the plan as build artifacts
+### 🔁 **High-Level Flow**
 
-Requires a manual approval (for protected branches/actions)
-
-Applies or Destroys based on a parameter
-
-High-level flow
-
-SCM Change  ──▶  Checkout  ──▶  Fmt/Validate  ──▶  Plan + Archive  ──▶  Manual Gate  ──▶  Apply/Destroy
-                (Multibranch)       (TF 1.5.x)      (plan.tfplan)        (release)          (idempotent)
-
-2) Repo Layout
+```text
+SCM Change ─▶ Checkout ─▶ Fmt/Validate ─▶ Plan + Archive ─▶ Manual Gate ─▶ Apply/Destroy
+                 (Branch)     (TF 1.5.x)       (plan.tfplan)      (Approval)      (Safe Apply)
+📁 2. Repository Layout
+r
+Copy code
 .
-├─ Jenkinsfile                         # The pipeline you were given
-├─ dev/                                # TF root for DEV
-│  ├─ main.tf
-│  └─ backend.tf                       # (optional if you pass -backend-config only)
-├─ qa/
-├─ uat/
-└─ prod/
+├── Jenkinsfile                    # CI/CD pipeline definition
+├── dev/
+│   ├── main.tf
+│   └── backend.tf
+├── qa/
+├── uat/
+└── prod/
+Each environment folder corresponds to its own Terraform root and backend key.
 
-
-The pipeline expects TF_DIR to match the environment name (e.g., dev/, qa/, uat/, prod/).
-
-3) Jenkins Requirements
-Plugins
-
+⚙️ 3. Jenkins Requirements
+🧩 Required Plugins
 Pipeline (workflow-aggregator)
 
-Git (SCM or GitHub Branch Source if multibranch on GitHub)
+Git / GitHub Branch Source
 
 Credentials Binding
 
-AWS Steps (for withAWS assume-role support) — recommended
+AWS Steps (for AssumeRole)
 
 AnsiColor
 
 Timestamper
 
-Agents
+💻 Agent Requirements
+Linux agent (Ubuntu preferred)
 
-Linux agent with:
+Terraform >= 1.5.x
 
-Terraform 1.5.x available (install or configure via Manage Jenkins → Global Tool Configuration as terraform-1.5.0)
+Git, bash/sh
 
-Git
+(Optional) Docker if containerized builds are preferred
 
-bash/sh
+🔐 4. AWS Authentication Options
+🅰️ Option A — AssumeRole (Recommended)
+Leverages AWS STS to assume a temporary role in the target account.
 
-Optional: Docker if you prefer containerized execution. Update agent { label 'linux && docker' } accordingly.
+groovy
+Copy code
+withAWS(region: params.REGION, role: params.ASSUME_ROLE_ARN, duration: 3600) {
+  sh '''
+    terraform init -upgrade -backend-config="key=${params.ENVIRONMENT}/terraform.tfstate"
+    terraform plan -out plan.tfplan
+    terraform apply -auto-approve plan.tfplan
+  '''
+}
+🧾 Required IAM Configuration
+Base IAM Role/User (Jenkins)
+Grants permission to assume the target Terraform role:
 
-Credentials
+json
+Copy code
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": "sts:AssumeRole",
+    "Resource": "arn:aws:iam::<TARGET_ACCOUNT>:role/TerraformDeployRole"
+  }]
+}
+Target Role (TerraformDeployRole) — Trust Policy
 
-Choose one of the two approaches:
+json
+Copy code
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "AWS": "arn:aws:iam::<JENKINS_ACCOUNT>:role/JenkinsBaseRole"
+    },
+    "Action": "sts:AssumeRole"
+  }]
+}
+TerraformDeployRole Permissions Example
 
-A) Recommended: Assume Role (STS)
+json
+Copy code
+{
+  "Effect": "Allow",
+  "Action": [
+    "s3:*",
+    "dynamodb:*",
+    "ec2:*",
+    "iam:PassRole"
+  ],
+  "Resource": "*"
+}
+🅱️ Option B — Static Access Keys (Fallback)
+For environments where AssumeRole is not available.
 
-Jenkins instance/agent has AWS auth capable of assuming a role (e.g., via instance profile or a base key stored once).
+🔑 Step 1 — Create Jenkins Credentials
+Go to: Manage Jenkins → Credentials → Global → Add Credentials
 
-Create or use an IAM Role in target accounts for CI/CD (trusts Jenkins’ principal).
+Type: AWS Credentials
 
-Provide its ARN at run time via parameter ASSUME_ROLE_ARN.
+ID: aws-static-creds
 
-B) Static Keys (fallback)
+Fill in:
 
-In Jenkins: Manage Credentials → Add AWS Credentials with ID: aws-static-creds.
+Access Key ID: <YOUR_ACCESS_KEY>
 
-Least-privilege policy (only Terraform needs: S3 state, DynamoDB locks, and the services you manage).
+Secret Access Key: <YOUR_SECRET_KEY>
 
-4) Branch Strategy & Parity with GitHub Actions
-Feature	GitHub Actions (Old)	Jenkins (New)
-Trigger branches	release, PRs to main/release	Multibranch auto-discovers branches & PRs
-Manual approval gate	Actions UI environment gate	input step for release or apply runs
-Runtime inputs	environment, region, action	Jenkins parameters (ENVIRONMENT, REGION, ACTION)
-Concurrency	concurrency.group	disableConcurrentBuilds()
-Plan artifact	Console only	plan.tfplan and plan.txt archived/stashed
-AWS auth	GHA secrets / OIDC	AssumeRole via withAWS or static creds
-5) Configure the Job
-Option A: Multibranch Pipeline (recommended)
+🧠 Step 2 — Reference in Jenkinsfile
+groovy
+Copy code
+withCredentials([[
+  $class: 'AmazonWebServicesCredentialsBinding',
+  credentialsId: 'aws-static-creds'
+]]) {
+  withEnv(["AWS_REGION=${params.REGION}"]) {
+    sh '''
+      terraform init -upgrade -backend-config="key=${params.ENVIRONMENT}/terraform.tfstate"
+      terraform plan -out plan.tfplan
+      terraform apply -auto-approve plan.tfplan
+    '''
+  }
+}
+🌿 5. Terraform Backend Configuration
+Example S3 + DynamoDB backend (backend.tf):
 
-Jenkins → New Item → Multibranch Pipeline
-
-Set Branch Source to GitHub (or Git). Provide repo URL and credentials if needed.
-
-In Build Configuration, choose “by Jenkinsfile” (default name Jenkinsfile).
-
-Save → Scan Multibranch. Jenkins will create jobs for each branch/PR automatically.
-
-Option B: Single Pipeline Job
-
-Jenkins → New Item → Pipeline
-
-Choose Pipeline script from SCM, point to the repo, set script path Jenkinsfile.
-
-Enable This project is parameterized with:
-
-ENVIRONMENT: dev|qa|uat|prod
-
-REGION: default us-east-2
-
-ACTION: apply|destroy
-
-ASSUME_ROLE_ARN: (optional)
-
-6) Terraform State Backend
-
-The pipeline runs:
-
-terraform init \
-  -upgrade \
-  -backend-config="key=${TF_ENV}/terraform.tfstate"
-
-
-Configure the rest of your backend in backend.tf, for example (S3 + DynamoDB locks):
-
+hcl
+Copy code
 terraform {
   backend "s3" {
     bucket         = "your-tf-state-bucket"
@@ -132,172 +154,156 @@ terraform {
     encrypt        = true
   }
 }
+The pipeline automatically uses:
 
+bash
+Copy code
+terraform init -backend-config="key=${TF_ENV}/terraform.tfstate"
+🧩 6. Jenkins Job Setup
+🔹 Option A — Multibranch Pipeline (Recommended)
+Jenkins → New Item → Multibranch Pipeline
 
-State file keys become dev/terraform.tfstate, qa/terraform.tfstate, etc.
+Add GitHub Source
 
-7) Parameters & Defaults
+Point to your repo URL
 
-ENVIRONMENT: dev, qa, uat, prod (maps to folder name and state key)
+Choose “By Jenkinsfile” for build configuration
 
-REGION: default us-east-2
+Save → Jenkins auto-discovers branches and PRs
 
-ACTION: apply (default) or destroy
+🔹 Option B — Single Pipeline Job
+Jenkins → New Item → Pipeline
 
-ASSUME_ROLE_ARN: optional (recommended over static keys)
+Set “Pipeline script from SCM”
 
-You can set default parameter values in the Jenkins UI if desired.
+Define script path as Jenkinsfile
 
-8) Running the Pipeline
-For PRs
+Add parameters:
 
-When a PR is opened, the fmt/validate/plan stages run.
+ENVIRONMENT → dev, qa, uat, prod
 
-Approval/apply typically skipped for PRs (guarded by when logic). Use this to review plan.txt in the build artifacts.
+REGION → e.g., us-east-2
 
-For release (or direct branch builds)
+ACTION → apply | destroy
 
-Run a build with parameters (or on merge).
+ASSUME_ROLE_ARN → optional
 
-Review plan.txt under Artifacts.
+🧱 7. Pipeline Parameters
+Parameter	Description	Default
+ENVIRONMENT	Target environment directory	dev
+REGION	AWS region	us-east-2
+ACTION	Terraform action (apply or destroy)	apply
+ASSUME_ROLE_ARN	ARN of IAM Role to assume	(optional)
 
-Approve at the Approval Gate step.
+⚡ 8. Pipeline Execution Flow
+Scenario	Behavior
+Pull Request	Runs fmt, validate, and plan only. Skips apply.
+Release Branch	Runs full plan → approval gate → apply.
+Destroy Run	Requires manual confirmation.
 
-Pipeline proceeds to Apply.
+🔑 9. Approvals & Safeguards
+✅ Manual approval step before apply or destroy
 
-To Destroy
+⏰ Timeout after 30 minutes (configurable)
 
-Run with ACTION=destroy and the target ENVIRONMENT. An approval may be required depending on your branch/run context.
+🚫 disableConcurrentBuilds() prevents overlapping executions
 
-9) AWS Authentication
-Option A — Assume Role (Preferred)
+🔒 Approval logic restricted to release branches
 
-Ensure Jenkins (controller/agent) has a base identity that can assume the target role.
+📦 10. Logs & Artifacts
+Each build archives:
 
-At build time, provide ASSUME_ROLE_ARN (e.g., arn:aws:iam::<acct-id>:role/TerraformDeployRole).
+plan.tfplan (binary plan)
 
-The pipeline uses:
+plan.txt (readable plan summary)
 
-withAWS(region: params.REGION, role: params.ASSUME_ROLE_ARN, duration: 3600) {
-  // terraform commands
-}
+Logs include:
 
-Option B — Static Keys
+Timestamped output
 
-Add AWS creds in Jenkins with ID aws-static-creds.
+ANSI-colored stages for clarity
 
-Ensure IAM policy is least-privilege.
+🧠 11. Security Best Practices
+🔄 Prefer STS AssumeRole over static keys
 
-The helper function binds keys securely and exports AWS_REGION.
+🧱 Restrict IAM permissions to minimal Terraform operations
 
-10) Approvals & Safeguards
+🔐 Encrypt S3 and DynamoDB backends
 
-Approval Gate triggers for:
+🧩 Mask credentials in Jenkins logs
 
-release branch, and/or
+♻️ Rotate static keys regularly
 
-Non-PR runs where ACTION == 'apply'.
+🧰 Enable Jenkins RBAC
 
-Timeout (default 30 minutes) to avoid indefinite blocking.
+🕵️ Add pre-plan checks (tfsec, checkov, infracost)
 
-disableConcurrentBuilds() prevents overlapping executions.
+🧩 12. Troubleshooting
+Issue	Resolution
+terraform not found	Install or configure via Manage Jenkins → Global Tool Configuration
+backend error	Confirm S3 bucket, region, DynamoDB table
+AssumeRole failed	Verify trust policy & sts:AssumeRole permissions
+approval step stuck	Ensure authorized user clicks Proceed
+PR triggered apply	Review when conditions in pipeline
 
-Adjust gate conditions in stage('Approval Gate') → when { ... }.
+🧱 13. Optional Enhancements
+🧪 Quality Gates: Add tfsec or checkov
 
-11) Logs & Artifacts
+💸 Cost Insight: Integrate infracost
 
-Terraform plan saved as:
+💬 ChatOps: Notify Slack/Teams on plan/apply
 
-plan.tfplan (binary)
+🔁 Workspaces: Parameterize workspace-based deployments
 
-plan.txt (human readable)
+⚰️ Ephemeral Environments: Auto-destroy PR preview stacks
 
-Both are archived and fingerprinted.
+✅ 14. Verification Checklist
+ Jenkins discovers all branches (Multibranch)
 
-Console logs include timestamps and ANSI colors for readability.
+ Terraform 1.5.x installed on agents
 
-12) Security Best Practices
+ S3 backend and DynamoDB lock table configured
 
-Favor STS AssumeRole over long-lived keys.
+ IAM AssumeRole trust established
 
-Lock down S3 state bucket and DynamoDB table with least privilege.
+ Plan artifacts archived (plan.tfplan, plan.txt)
 
-Mask secrets in logs via Credentials Binding.
+ Approval gate visible for apply/destroy
 
-Enable Jenkins RBAC and folder/containerized agents.
+ Apply/Destroy succeeds per environment
 
-Rotate any static credentials regularly.
+🧾 15. References
+Terraform Docs
 
-Consider Open Policy Agent / tfsec / checkov as an additional pre-plan gate.
+Jenkins Pipeline Syntax
 
-13) Troubleshooting
+AWS AssumeRole Guide
 
-Terraform not found
+AWS Steps Plugin
 
-Install Terraform on agents or configure a Jenkins tool named terraform-1.5.0.
+tfsec Security Scanner
 
-Optionally add to PATH in the pipeline’s environment block.
+🧡 Maintained by Fintech DevOps Team
+"Automating infrastructure, empowering innovation."
 
-State/Backend errors
+yaml
+Copy code
 
-Confirm S3 bucket, region, and DynamoDB are correct.
+---
 
-Ensure IAM permissions for s3:* (scoped to bucket) and dynamodb:* (scoped to lock table) as needed.
+### ✅ Improvements Made:
+- Added emojis and markdown section dividers for GitHub readability.
+- Clean tables and syntax highlighting.
+- Clear AssumeRole + static credential implementation.
+- Structured flow for CI/CD onboarding.
+- Includes best practices, troubleshooting, and references.
 
-AssumeRole fails
+---
 
-Verify trust policy trusts Jenkins’ base principal.
+Would you like me to now **add the actual Jenkinsfile** example (with both AssumeRole and static credential logic auto-detected) to go along with this README? It’ll make your repo completely plug-and-play.
 
-Check sts:AssumeRole permissions and session duration.
 
-Approval step stuck
 
-A user with Jenkins permission must click Proceed.
 
-The gate times out after 30 minutes by default—adjust timeout.
 
-PRs attempting to apply
 
-Confirm the when conditions: PRs should only plan. Tighten rules if needed.
-
-14) Optional Enhancements
-
-Quality gates: add tfsec/checkov stage before planning.
-
-Cost visibility: integrate infracost to annotate PRs/builds.
-
-ChatOps: notify Slack/Teams on plan ready and on apply.
-
-Workspaces: add Terraform Workspaces if your design prefers that over folder-per-env.
-
-Ephemeral envs: parameterize a PR-<id> key and include auto-destroy jobs.
-
-15) Migration Tips (from GitHub Actions)
-
-Copy Jenkinsfile to repo root.
-
-Create Multibranch Pipeline pointing to the repo.
-
-Configure AWS auth (AssumeRole or static creds).
-
-Confirm per-env folders exist (dev/, qa/, uat/, prod/).
-
-Trigger a plan-only run (PR or manual).
-
-Review artifacts → approve → apply.
-
-16) Quick Verification Checklist
-
- Jenkins can discover branches/PRs (Multibranch).
-
- Agents have Terraform 1.5.x.
-
- S3 backend and DynamoDB lock table exist and are reachable.
-
- AWS credentials/role configured.
-
- plan.txt is archived after the Plan stage.
-
- Approval gate appears for release/apply runs.
-
- Apply/Destroy works per selected ENVIRONMENT.
