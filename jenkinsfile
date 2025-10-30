@@ -7,7 +7,7 @@ pipeline {
     string(name: 'REGION', defaultValue: 'us-east-2', description: 'AWS Region')
     choice(name: 'ACTION', choices: ['apply', 'destroy'], description: 'Terraform action')
     // Optional: if you prefer assuming a role instead of static keys, set a role ARN here and configure AWS Steps plugin.
-    string(name: 'ASSUME_ROLE_ARN', defaultValue: '', description: 'Optional: STS role ARN to assume (leave blank to use static AWS creds)')
+    string(name: 'ASSUME_ROLE_ARN', defaultValue: 'arn:aws:iam::327019199684:role/jenkins-ssm-role', description: 'Optional: STS role ARN to assume (leave blank to use static AWS creds)')
   }
 
   /* ---- Global env ---- */
