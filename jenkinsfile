@@ -1,39 +1,36 @@
 pipeline {
-  agent any
+   agent { label 'cd-cd-node' }
 
-  /* ---------- Parameters ---------- */
   parameters {
     choice(name: 'ENVIRONMENT', choices: ['dev', 'qa', 'uat', 'prod'], description: 'Deployment Environment')
     string(name: 'REGION', defaultValue: 'us-west-2', description: 'AWS Region')
-    choice(name: 'ACTION', choices: ['apply', 'destroy'], description: 'Terraform action')
-
-    // IMPORTANT: This must be the *deploy* role (e.g., TerraformDeployRole), not your instance profile/base role.
-    // You may leave this blank and set TERRAFORM_DEPLOY_ROLE_ARN as a global env var in Jenkins System Settings.
+    choice(name: 'ACTION', choices: ['plan', 'apply', 'destroy'], description: 'Terraform action')
+    // Must be the *deploy* role (not the instance profile/base role)
     string(
       name: 'ASSUME_ROLE_ARN',
-      defaultValue: 'arn:aws:iam::327019199684:role/TerraformDeployRole',
-      description: 'STS role ARN to assume for Terraform (deploy role, not base role)'
+      defaultValue: 'arn:aws:iam::327019199684:role/cicd-ec2-role',
+      description: 'STS role ARN to assume for Terraform (deploy role)'
     )
   }
 
-  /* ---------- Global env ---------- */
   environment {
     TF_ENV            = "${params.ENVIRONMENT}"
     AWS_REGION        = "${params.REGION}"
-    TF_DIR            = "${params.ENVIRONMENT}"  // folder per env (dev/qa/uat/prod)
+    TF_DIR            = "${params.ENVIRONMENT}"   // folder per env (dev/qa/uat/prod)
     TF_INPUT          = 'false'
     TF_IN_AUTOMATION  = 'true'
-    // If you configure a Jenkins tool named "terraform-1.13.4":
-    // PATH = "${tool 'terraform-1.13.4'}/bin:${env.PATH}"
+    TF_PLUGIN_CACHE_DIR = "${env.WORKSPACE}/.terraform.d/plugin-cache"
+    // If you manage Terraform as a Jenkins tool:
+    // PATH = "${tool 'terraform-1.7.5'}/bin:${env.PATH}"
   }
 
-  /* ---------- Options ---------- */
   options {
     disableConcurrentBuilds()
     buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '30'))
     timestamps()
     ansiColor('xterm')
     timeout(time: 60, unit: 'MINUTES')
+    // optional: skipDefaultCheckout(true)
   }
 
   stages {
@@ -56,39 +53,60 @@ pipeline {
       }
     }
 
-    stage('Terraform Setup') {
+    stage('Tooling Setup') {
       steps {
-        sh 'terraform version || true'
+        sh '''
+          mkdir -p .terraform.d/plugin-cache
+          terraform version || true
+          aws --version || true
+        '''
       }
     }
 
-    stage('WhoAmI (before assume)') {
+    stage('WhoAmI (base instance profile)') {
       steps {
         sh 'aws sts get-caller-identity || true'
       }
     }
 
-    stage('Terraform Fmt / Validate') {
-      steps {
-        sh """
-          cd "${TF_DIR}"
-          terraform fmt -check -recursive
-          terraform init -upgrade -backend-config="key=${TF_ENV}/terraform.tfstate"
-          terraform validate
-        """
-      }
-    }
-
-    stage('Terraform Plan') {
+    stage('Init / Validate (assumed role)') {
       steps {
         script {
           def roleArn = chooseRoleArn(params.ASSUME_ROLE_ARN)
           withAssumedRole(AWS_REGION, roleArn) {
             sh """
+              set -euo pipefail
               cd "${TF_DIR}"
-              terraform plan -lock=false -out plan.tfplan
-              terraform show -no-color plan.tfplan > plan.txt
+              export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR}"
+              terraform fmt -check -recursive
+              terraform init -upgrade \
+                -backend-config="key=${TF_ENV}/terraform.tfstate" \
+                -lock-timeout=5m
+              terraform validate -no-color
+              aws sts get-caller-identity
             """
+          }
+        }
+      }
+    }
+
+    stage('Plan (assumed role)') {
+      when { anyOf { expression { params.ACTION == 'plan' }; expression { params.ACTION == 'apply' } } }
+      steps {
+        script {
+          def roleArn = chooseRoleArn(params.ASSUME_ROLE_ARN)
+          lock(resource: "tfstate-${params.ENVIRONMENT}") {
+            withAssumedRole(AWS_REGION, roleArn) {
+              sh """
+                set -euo pipefail
+                cd "${TF_DIR}"
+                export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR}"
+                terraform plan -no-color -compact-warnings -lock-timeout=5m \
+                  -var-file="${TF_ENV}.tfvars" \
+                  -out plan.tfplan
+                terraform show -no-color plan.tfplan > plan.txt
+              """
+            }
           }
         }
         archiveArtifacts artifacts: "${TF_DIR}/plan.tfplan, ${TF_DIR}/plan.txt", fingerprint: true
@@ -96,11 +114,11 @@ pipeline {
       }
     }
 
-    stage('Approval Gate') {
+    stage('Approval Gate (apply/destroy)') {
       when {
         anyOf {
-          branch 'release'
-          allOf { not { changeRequest() }; expression { params.ACTION == 'apply' } }
+          expression { params.ACTION == 'apply' }
+          expression { params.ACTION == 'destroy' }
         }
       }
       steps {
@@ -113,40 +131,48 @@ pipeline {
       }
     }
 
-    stage('Terraform Apply') {
+    stage('Apply (assumed role)') {
       when { expression { params.ACTION == 'apply' } }
       steps {
         script {
           def roleArn = chooseRoleArn(params.ASSUME_ROLE_ARN)
-          unstash 'tf-plan-bundle'
-          withAssumedRole(AWS_REGION, roleArn) {
-            sh """
-              cd "${TF_DIR}"
-              terraform init -backend-config="key=${TF_ENV}/terraform.tfstate"
-              terraform apply -auto-approve -lock=false plan.tfplan
-            """
+          lock(resource: "tfstate-${params.ENVIRONMENT}") {
+            withAssumedRole(AWS_REGION, roleArn) {
+              unstash 'tf-plan-bundle'
+              sh """
+                set -euo pipefail
+                cd "${TF_DIR}"
+                export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR}"
+                terraform init -lock-timeout=5m -backend-config="key=${TF_ENV}/terraform.tfstate"
+                terraform apply -auto-approve -lock-timeout=5m plan.tfplan
+              """
+            }
           }
         }
       }
     }
 
-    stage('Terraform Destroy') {
+    stage('Destroy (assumed role)') {
       when { expression { params.ACTION == 'destroy' } }
       steps {
         script {
           def roleArn = chooseRoleArn(params.ASSUME_ROLE_ARN)
-          withAssumedRole(AWS_REGION, roleArn) {
-            sh """
-              cd "${TF_DIR}"
-              terraform init -backend-config="key=${TF_ENV}/terraform.tfstate"
-              terraform destroy -auto-approve -lock=false
-            """
+          lock(resource: "tfstate-${params.ENVIRONMENT}") {
+            withAssumedRole(AWS_REGION, roleArn) {
+              sh """
+                set -euo pipefail
+                cd "${TF_DIR}"
+                export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR}"
+                terraform init -lock-timeout=5m -backend-config="key=${TF_ENV}/terraform.tfstate"
+                terraform destroy -auto-approve -lock-timeout=5m -var-file="${TF_ENV}.tfvars"
+              """
+            }
           }
         }
       }
     }
 
-    stage('WhoAmI (after assume)') {
+    stage('WhoAmI (assumed role)') {
       steps {
         script {
           def roleArn = chooseRoleArn(params.ASSUME_ROLE_ARN)
@@ -171,22 +197,24 @@ pipeline {
   }
 }
 
-/* =======================================================================
-   Helpers: force AssumeRole (no static fallback) + role selection
-   ======================================================================= */
+/* ========================= Helpers ========================= */
 
 def chooseRoleArn(String paramArn) {
-  def arn = (paramArn?.trim()) ? paramArn.trim() : (env.TERRAFORM_DEPLOY_ROLE_ARN ?: '').trim()
+  def arn = (paramArn?.trim()) ?: (env.TERRAFORM_DEPLOY_ROLE_ARN ?: '').trim()
   if (!arn) {
-    error """No deploy role ARN provided.
-- Set the pipeline parameter ASSUME_ROLE_ARN, or
-- Configure a global env var TERRAFORM_DEPLOY_ROLE_ARN in Jenkins System Settings."""
+    error "No deploy role ARN provided. Set ASSUME_ROLE_ARN param or TERRAFORM_DEPLOY_ROLE_ARN global env."
   }
-  echo "Using deploy role ARN: ${arn}"
+  // Avoid echoing the raw ARN to keep logs tidy
+  echo "Using deploy role for Terraform."
   return arn
 }
 
+// Requires the AWS Steps plugin (withAWS)
 def withAssumedRole(String region, String roleArn, Closure body) {
-  // Requires the AWS Steps plugin
-  withAWS(region: region, role: roleArn, duration: 3600) { body() }
+  withAWS(
+    region: region,
+    role: roleArn,
+    roleSessionName: "jenkins-${env.JOB_NAME?.replaceAll('[^A-Za-z0-9-]', '-')}-${env.BUILD_NUMBER}",
+    duration: 3600
+  ) { body() }
 }
