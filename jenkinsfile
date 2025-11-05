@@ -1,5 +1,5 @@
 pipeline {
-   agent { label 'cd-cd-node' }
+   agent { label 'ci-cd-node' }
 
   parameters {
     choice(name: 'ENVIRONMENT', choices: ['dev', 'qa', 'uat', 'prod'], description: 'Deployment Environment')
