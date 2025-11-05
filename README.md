@@ -45,7 +45,9 @@ AWS Steps (for AssumeRole)
 
 AnsiColor
 
-Timestamper
+Timestamper 
+
+Lock Resources
 
 💻 Agent Requirements
 Linux agent (Ubuntu preferred)
