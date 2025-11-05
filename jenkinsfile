@@ -1,27 +1,19 @@
 pipeline {
-   agent { label 'ci-cd-node' }
+  agent { label 'ci-cd-node' }
 
   parameters {
     choice(name: 'ENVIRONMENT', choices: ['dev', 'qa', 'uat', 'prod'], description: 'Deployment Environment')
     string(name: 'REGION', defaultValue: 'us-west-2', description: 'AWS Region')
     choice(name: 'ACTION', choices: ['plan', 'apply', 'destroy'], description: 'Terraform action')
-    // Must be the *deploy* role (not the instance profile/base role)
-    string(
-      name: 'ASSUME_ROLE_ARN',
-      defaultValue: 'arn:aws:iam::327019199684:role/cicd-ec2-role',
-      description: 'STS role ARN to assume for Terraform (deploy role)'
-    )
   }
 
   environment {
-    TF_ENV            = "${params.ENVIRONMENT}"
-    AWS_REGION        = "${params.REGION}"
-    TF_DIR            = "${params.ENVIRONMENT}"   // folder per env (dev/qa/uat/prod)
-    TF_INPUT          = 'false'
-    TF_IN_AUTOMATION  = 'true'
+    TF_ENV              = "${params.ENVIRONMENT}"
+    AWS_REGION          = "${params.REGION}"
+    TF_DIR              = "${params.ENVIRONMENT}"     // dev/qa/uat/prod folder
+    TF_INPUT            = 'false'
+    TF_IN_AUTOMATION    = 'true'
     TF_PLUGIN_CACHE_DIR = "${env.WORKSPACE}/.terraform.d/plugin-cache"
-    // If you manage Terraform as a Jenkins tool:
-    // PATH = "${tool 'terraform-1.7.5'}/bin:${env.PATH}"
   }
 
   options {
@@ -30,7 +22,6 @@ pipeline {
     timestamps()
     ansiColor('xterm')
     timeout(time: 60, unit: 'MINUTES')
-    // optional: skipDefaultCheckout(true)
   }
 
   stages {
@@ -38,183 +29,111 @@ pipeline {
     stage('Checkout') {
       steps {
         checkout scm
-        script {
-          echo "Branch: ${env.BRANCH_NAME ?: 'N/A'} | PR: ${env.CHANGE_ID ?: 'no'}"
-        }
+        script { echo "Branch: ${env.BRANCH_NAME ?: 'N/A'} | PR: ${env.CHANGE_ID ?: 'no'}" }
       }
     }
 
-    stage('Verify Working Directory') {
+    stage('WhoAmI') {
       steps {
-        sh """
-          echo "Working in ./${TF_DIR}"
-          ls -la "./${TF_DIR}"
-        """
+        sh '''
+          set -e
+          aws --version || true
+          echo "Base identity (instance profile):"
+          aws sts get-caller-identity || true
+        '''
       }
     }
 
     stage('Tooling Setup') {
       steps {
         sh '''
+          set -e
           mkdir -p .terraform.d/plugin-cache
           terraform version || true
-          aws --version || true
         '''
       }
     }
 
-    stage('WhoAmI (base instance profile)') {
+    stage('Init & Validate') {
       steps {
-        sh 'aws sts get-caller-identity || true'
+        sh """
+          set -euo pipefail
+          cd "${TF_DIR}"
+          export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR}"
+          terraform fmt -check -recursive
+          terraform init -upgrade \
+            -backend-config="key=${TF_ENV}/terraform.tfstate" \
+            -lock-timeout=5m
+          terraform validate -no-color
+          aws sts get-caller-identity
+        """
       }
     }
 
-    stage('Init / Validate (assumed role)') {
-      steps {
-        script {
-          def roleArn = chooseRoleArn(params.ASSUME_ROLE_ARN)
-          withAssumedRole(AWS_REGION, roleArn) {
-            sh """
-              set -euo pipefail
-              cd "${TF_DIR}"
-              export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR}"
-              terraform fmt -check -recursive
-              terraform init -upgrade \
-                -backend-config="key=${TF_ENV}/terraform.tfstate" \
-                -lock-timeout=5m
-              terraform validate -no-color
-              aws sts get-caller-identity
-            """
-          }
-        }
-      }
-    }
-
-    stage('Plan (assumed role)') {
+    stage('Plan') {
       when { anyOf { expression { params.ACTION == 'plan' }; expression { params.ACTION == 'apply' } } }
       steps {
-        script {
-          def roleArn = chooseRoleArn(params.ASSUME_ROLE_ARN)
-          lock(resource: "tfstate-${params.ENVIRONMENT}") {
-            withAssumedRole(AWS_REGION, roleArn) {
-              sh """
-                set -euo pipefail
-                cd "${TF_DIR}"
-                export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR}"
-                terraform plan -no-color -compact-warnings -lock-timeout=5m \
-                  -var-file="${TF_ENV}.tfvars" \
-                  -out plan.tfplan
-                terraform show -no-color plan.tfplan > plan.txt
-              """
-            }
-          }
+        lock(resource: "tfstate-${params.ENVIRONMENT}") {
+          sh """
+            set -euo pipefail
+            cd "${TF_DIR}"
+            export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR}"
+            terraform plan -no-color -compact-warnings -lock-timeout=5m \
+              -var-file="${TF_ENV}.tfvars" \
+              -out plan.tfplan
+            terraform show -no-color plan.tfplan > plan.txt
+          """
         }
         archiveArtifacts artifacts: "${TF_DIR}/plan.tfplan, ${TF_DIR}/plan.txt", fingerprint: true
         stash name: 'tf-plan-bundle', includes: "${TF_DIR}/plan.tfplan, ${TF_DIR}/plan.txt"
       }
     }
 
-    stage('Approval Gate (apply/destroy)') {
-      when {
-        anyOf {
-          expression { params.ACTION == 'apply' }
-          expression { params.ACTION == 'destroy' }
-        }
-      }
+    stage('Approval') {
+      when { anyOf { expression { params.ACTION == 'apply' }; expression { params.ACTION == 'destroy' } } }
       steps {
-        script {
-          timeout(time: 30, unit: 'MINUTES') {
-            input message: "Approve ${params.ACTION.toUpperCase()} for ENV=${params.ENVIRONMENT}, REGION=${params.REGION} on branch ${env.BRANCH_NAME ?: 'N/A'}?",
-                  ok: 'Approve'
-          }
+        timeout(time: 30, unit: 'MINUTES') {
+          input message: "Approve ${params.ACTION.toUpperCase()} for ${params.ENVIRONMENT} in ${params.REGION}?",
+                ok: 'Approve'
         }
       }
     }
 
-    stage('Apply (assumed role)') {
+    stage('Apply') {
       when { expression { params.ACTION == 'apply' } }
       steps {
-        script {
-          def roleArn = chooseRoleArn(params.ASSUME_ROLE_ARN)
-          lock(resource: "tfstate-${params.ENVIRONMENT}") {
-            withAssumedRole(AWS_REGION, roleArn) {
-              unstash 'tf-plan-bundle'
-              sh """
-                set -euo pipefail
-                cd "${TF_DIR}"
-                export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR}"
-                terraform init -lock-timeout=5m -backend-config="key=${TF_ENV}/terraform.tfstate"
-                terraform apply -auto-approve -lock-timeout=5m plan.tfplan
-              """
-            }
-          }
+        lock(resource: "tfstate-${params.ENVIRONMENT}") {
+          unstash 'tf-plan-bundle'
+          sh """
+            set -euo pipefail
+            cd "${TF_DIR}"
+            export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR}"
+            terraform init -lock-timeout=5m -backend-config="key=${TF_ENV}/terraform.tfstate"
+            terraform apply -auto-approve -lock-timeout=5m plan.tfplan
+          """
         }
       }
     }
 
-    stage('Destroy (assumed role)') {
+    stage('Destroy') {
       when { expression { params.ACTION == 'destroy' } }
       steps {
-        script {
-          def roleArn = chooseRoleArn(params.ASSUME_ROLE_ARN)
-          lock(resource: "tfstate-${params.ENVIRONMENT}") {
-            withAssumedRole(AWS_REGION, roleArn) {
-              sh """
-                set -euo pipefail
-                cd "${TF_DIR}"
-                export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR}"
-                terraform init -lock-timeout=5m -backend-config="key=${TF_ENV}/terraform.tfstate"
-                terraform destroy -auto-approve -lock-timeout=5m -var-file="${TF_ENV}.tfvars"
-              """
-            }
-          }
-        }
-      }
-    }
-
-    stage('WhoAmI (assumed role)') {
-      steps {
-        script {
-          def roleArn = chooseRoleArn(params.ASSUME_ROLE_ARN)
-          withAssumedRole(AWS_REGION, roleArn) {
-            sh 'aws sts get-caller-identity'
-          }
+        lock(resource: "tfstate-${params.ENVIRONMENT}") {
+          sh """
+            set -euo pipefail
+            cd "${TF_DIR}"
+            export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR}"
+            terraform init -lock-timeout=5m -backend-config="key=${TF_ENV}/terraform.tfstate"
+            terraform destroy -auto-approve -lock-timeout=5m -var-file="${TF_ENV}.tfvars"
+          """
         }
       }
     }
   }
 
   post {
-    success {
-      echo "✅ Success: ${params.ACTION} for ${params.ENVIRONMENT} in ${params.REGION}"
-    }
-    failure {
-      echo "❌ Failed: ${params.ACTION} for ${params.ENVIRONMENT} in ${params.REGION}"
-    }
-    always {
-      cleanWs(deleteDirs: true, notFailBuild: true)
-    }
+    success { echo "✅ ${params.ACTION} for ${params.ENVIRONMENT} in ${params.REGION} succeeded." }
+    failure { echo "❌ ${params.ACTION} for ${params.ENVIRONMENT} in ${params.REGION} failed." }
+    always  { cleanWs(deleteDirs: true, notFailBuild: true) }
   }
-}
-
-/* ========================= Helpers ========================= */
-
-def chooseRoleArn(String paramArn) {
-  def arn = (paramArn?.trim()) ?: (env.TERRAFORM_DEPLOY_ROLE_ARN ?: '').trim()
-  if (!arn) {
-    error "No deploy role ARN provided. Set ASSUME_ROLE_ARN param or TERRAFORM_DEPLOY_ROLE_ARN global env."
-  }
-  // Avoid echoing the raw ARN to keep logs tidy
-  echo "Using deploy role for Terraform."
-  return arn
-}
-
-// Requires the AWS Steps plugin (withAWS)
-def withAssumedRole(String region, String roleArn, Closure body) {
-  withAWS(
-    region: region,
-    role: roleArn,
-    roleSessionName: "jenkins-${env.JOB_NAME?.replaceAll('[^A-Za-z0-9-]', '-')}-${env.BUILD_NUMBER}",
-    duration: 3600
-  ) { body() }
 }
