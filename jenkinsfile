@@ -10,7 +10,7 @@ pipeline {
   environment {
     TF_ENV              = "${params.ENVIRONMENT}"
     AWS_REGION          = "${params.REGION}"
-    TF_DIR              = "${params.ENVIRONMENT}"     // dev/qa/uat/prod folder
+    TF_DIR              = "${params.ENVIRONMENT}"   // dev/qa/uat/prod folder
     TF_INPUT            = 'false'
     TF_IN_AUTOMATION    = 'true'
     TF_PLUGIN_CACHE_DIR = "${env.WORKSPACE}/.terraform.d/plugin-cache"
@@ -25,7 +25,6 @@ pipeline {
   }
 
   stages {
-
     stage('Checkout') {
       steps {
         checkout scm
@@ -56,8 +55,8 @@ pipeline {
 
     stage('Init & Validate') {
       steps {
-        sh """
-          set -euo pipefail
+        sh '''
+          bash -euo pipefail <<'BASH'
           cd "${TF_DIR}"
           export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR}"
           terraform fmt -check -recursive
@@ -66,7 +65,8 @@ pipeline {
             -lock-timeout=5m
           terraform validate -no-color
           aws sts get-caller-identity
-        """
+          BASH
+        '''
       }
     }
 
@@ -74,15 +74,16 @@ pipeline {
       when { anyOf { expression { params.ACTION == 'plan' }; expression { params.ACTION == 'apply' } } }
       steps {
         lock(resource: "tfstate-${params.ENVIRONMENT}") {
-          sh """
-            set -euo pipefail
+          sh '''
+            bash -euo pipefail <<'BASH'
             cd "${TF_DIR}"
             export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR}"
             terraform plan -no-color -compact-warnings -lock-timeout=5m \
               -var-file="${TF_ENV}.tfvars" \
               -out plan.tfplan
             terraform show -no-color plan.tfplan > plan.txt
-          """
+            BASH
+          '''
         }
         archiveArtifacts artifacts: "${TF_DIR}/plan.tfplan, ${TF_DIR}/plan.txt", fingerprint: true
         stash name: 'tf-plan-bundle', includes: "${TF_DIR}/plan.tfplan, ${TF_DIR}/plan.txt"
@@ -104,13 +105,14 @@ pipeline {
       steps {
         lock(resource: "tfstate-${params.ENVIRONMENT}") {
           unstash 'tf-plan-bundle'
-          sh """
-            set -euo pipefail
+          sh '''
+            bash -euo pipefail <<'BASH'
             cd "${TF_DIR}"
             export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR}"
             terraform init -lock-timeout=5m -backend-config="key=${TF_ENV}/terraform.tfstate"
             terraform apply -auto-approve -lock-timeout=5m plan.tfplan
-          """
+            BASH
+          '''
         }
       }
     }
@@ -119,13 +121,14 @@ pipeline {
       when { expression { params.ACTION == 'destroy' } }
       steps {
         lock(resource: "tfstate-${params.ENVIRONMENT}") {
-          sh """
-            set -euo pipefail
+          sh '''
+            bash -euo pipefail <<'BASH'
             cd "${TF_DIR}"
             export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR}"
             terraform init -lock-timeout=5m -backend-config="key=${TF_ENV}/terraform.tfstate"
             terraform destroy -auto-approve -lock-timeout=5m -var-file="${TF_ENV}.tfvars"
-          """
+            BASH
+          '''
         }
       }
     }
