@@ -13,7 +13,7 @@ module "vpc" {
 
 module "eks" {
   source       = "./../modules/eks-cluster"
-  providers    = { aws = aws }
+
   cluster_name = var.cluster_name
   rolearn      = var.rolearn
   cni_role_arn = module.iam.cni_role_arn
