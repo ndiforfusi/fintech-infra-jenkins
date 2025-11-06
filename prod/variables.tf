@@ -75,7 +75,7 @@ variable "instance_type" {
 variable "key_name" {
   description = "EC2 Key Pair name for SSH access"
   type        = string
-  default     = "class39-dominion"
+  default     = "Oregon-prvate-key"
 }
 
 ################################################################################
