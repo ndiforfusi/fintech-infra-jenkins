@@ -12,8 +12,8 @@ module "vpc" {
 # ################################################################################
 
 module "eks" {
-  source = "./../modules/eks-cluster"
-
+  source       = "./../modules/eks-cluster"
+  providers    = { aws = aws }
   cluster_name = var.cluster_name
   rolearn      = var.rolearn
   cni_role_arn = module.iam.cni_role_arn
@@ -24,9 +24,8 @@ module "eks" {
 
   # Enables EKS to bootstrap and manage the core addons
 
-  tags       = local.common_tags
-  env_name   = var.env_name
-  depends_on = [module.vpc]
+  tags     = local.common_tags
+  env_name = var.env_name
 }
 
 
