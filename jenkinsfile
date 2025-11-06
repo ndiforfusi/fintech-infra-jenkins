@@ -1,162 +1,136 @@
 pipeline {
-  agent { label 'linux && docker' } // adjust as needed
+  agent { label 'ci-cd-node' }
 
-  /* ---- Parameters (runtime overrides) ---- */
   parameters {
     choice(name: 'ENVIRONMENT', choices: ['dev', 'qa', 'uat', 'prod'], description: 'Deployment Environment')
-    string(name: 'REGION', defaultValue: 'us-east-2', description: 'AWS Region')
-    choice(name: 'ACTION', choices: ['apply', 'destroy'], description: 'Terraform action')
-    // Optional: if you prefer assuming a role instead of static keys, set a role ARN here and configure AWS Steps plugin.
-    string(name: 'ASSUME_ROLE_ARN', defaultValue: '', description: 'Optional: STS role ARN to assume (leave blank to use static AWS creds)')
+    string(name: 'REGION', defaultValue: 'us-west-2', description: 'AWS Region')
+    choice(name: 'ACTION', choices: ['plan', 'apply', 'destroy'], description: 'Terraform action')
   }
 
-  /* ---- Global env ---- */
   environment {
-    TF_ENV      = "${params.ENVIRONMENT}"
-    AWS_REGION  = "${params.REGION}"
-    TF_DIR      = "${params.ENVIRONMENT}"   // matches your per-env folder layout
-    TF_INPUT    = 'false'
-    TF_IN_AUTOMATION = 'true'
-    // If you’ve configured a Jenkins tool named "terraform-1.5.0" under Manage Jenkins » Global Tool Configuration:
-    // PATH = "${tool 'terraform-1.5.0'}/bin:${env.PATH}"
+    TF_ENV              = "${params.ENVIRONMENT}"
+    AWS_REGION          = "${params.REGION}"
+    TF_DIR              = "${params.ENVIRONMENT}"   // env folder (dev/qa/uat/prod)
+    TF_INPUT            = 'false'
+    TF_IN_AUTOMATION    = 'true'
+    TF_PLUGIN_CACHE_DIR = "${env.WORKSPACE}/.terraform.d/plugin-cache"
   }
 
-  /* ---- Pipeline options & concurrency ---- */
   options {
-    disableConcurrentBuilds()           // mirrors GH Actions concurrency group
+    disableConcurrentBuilds()
     buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '30'))
     timestamps()
     ansiColor('xterm')
-    timeout(time: 60, unit: 'MINUTES')  // end-to-end safety timeout
+    timeout(time: 60, unit: 'MINUTES')
   }
 
-  /* ---- Triggers (optional; Multibranch typically handles via webhooks) ---- */
-  // triggers { pollSCM('@daily') }
-
   stages {
-
     stage('Checkout') {
       steps {
         checkout scm
-        script {
-          echo "Branch: ${env.BRANCH_NAME ?: 'N/A'} | PR: ${env.CHANGE_ID ?: 'no'}"
-        }
+        script { echo "Branch: ${env.BRANCH_NAME ?: 'N/A'} | PR: ${env.CHANGE_ID ?: 'no'}" }
       }
     }
 
-    stage('Verify Working Directory') {
+    stage('WhoAmI') {
       steps {
-        sh """
-          echo "Working in ./${TF_DIR}"
-          ls -la "./${TF_DIR}"
-        """
+        sh '''
+          set -e
+          aws --version || true
+          echo "Base identity (instance profile):"
+          aws sts get-caller-identity || true
+        '''
       }
     }
 
-    stage('Terraform Setup') {
+    stage('Tooling Setup') {
       steps {
-        // Prefer preinstalled terraform via Jenkins tool (PATH set above) or tfenv in your agents.
-        sh 'terraform version || true'
+        sh '''
+          set -e
+          mkdir -p .terraform.d/plugin-cache
+          terraform version || true
+        '''
       }
     }
 
-    stage('Terraform Fmt / Validate') {
+    stage('Init & Validate') {
       steps {
-        sh """
-          cd "${TF_DIR}"
+        sh '''
+          bash -lc "set -euo pipefail
+          cd \\"$TF_DIR\\"
+          export TF_PLUGIN_CACHE_DIR=\\"$TF_PLUGIN_CACHE_DIR\\"
           terraform fmt -check -recursive
-          terraform init -upgrade -backend-config="key=${TF_ENV}/terraform.tfstate"
-          terraform validate
-        """
+          terraform init -upgrade -backend-config=\\"key=$TF_ENV/terraform.tfstate\\" -lock-timeout=5m
+          terraform validate -no-color
+          aws sts get-caller-identity"
+        '''
       }
     }
 
-    stage('Terraform Plan') {
+    stage('Plan') {
+      when { anyOf { expression { params.ACTION == 'plan' }; expression { params.ACTION == 'apply' } } }
       steps {
-        withAwsOrStaticCreds(AWS_REGION, params.ASSUME_ROLE_ARN) {
-          sh """
-            cd "${TF_DIR}"
-            terraform plan -lock=false -out plan.tfplan
-            terraform show -no-color plan.tfplan > plan.txt
-          """
+        lock(resource: "tfstate-${params.ENVIRONMENT}") {
+          sh '''
+            bash -lc "set -euo pipefail
+            cd \\"$TF_DIR\\"
+            export TF_PLUGIN_CACHE_DIR=\\"$TF_PLUGIN_CACHE_DIR\\"
+            terraform plan -no-color -compact-warnings -lock-timeout=5m \
+              -var-file=\\"$TF_ENV.tfvars\\" \
+              -out plan.tfplan
+            terraform show -no-color plan.tfplan > plan.txt"
+          '''
         }
         archiveArtifacts artifacts: "${TF_DIR}/plan.tfplan, ${TF_DIR}/plan.txt", fingerprint: true
         stash name: 'tf-plan-bundle', includes: "${TF_DIR}/plan.tfplan, ${TF_DIR}/plan.txt"
       }
     }
 
-    stage('Approval Gate') {
-      when {
-        anyOf {
-          // Require manual approval for changes into release branch, or anytime ACTION==apply on mainline.
-          branch 'release'
-          allOf { not { changeRequest() }; expression { params.ACTION == 'apply' } }
-        }
-      }
+    stage('Approval') {
+      when { anyOf { expression { params.ACTION == 'apply' }; expression { params.ACTION == 'destroy' } } }
       steps {
-        script {
-          timeout(time: 30, unit: 'MINUTES') {
-            input message: "Approve ${params.ACTION.toUpperCase()} for ENV=${params.ENVIRONMENT}, REGION=${params.REGION} on branch ${env.BRANCH_NAME ?: 'N/A'}?",
-                  ok: 'Approve'
-          }
+        timeout(time: 30, unit: 'MINUTES') {
+          input message: "Approve ${params.ACTION.toUpperCase()} for ${params.ENVIRONMENT} in ${params.REGION}?",
+                ok: 'Approve'
         }
       }
     }
 
-    stage('Terraform Apply') {
+    stage('Apply') {
       when { expression { params.ACTION == 'apply' } }
       steps {
-        unstash 'tf-plan-bundle'
-        withAwsOrStaticCreds(AWS_REGION, params.ASSUME_ROLE_ARN) {
-          sh """
-            cd "${TF_DIR}"
-            terraform init -backend-config="key=${TF_ENV}/terraform.tfstate"
-            terraform apply -auto-approve -lock=false plan.tfplan
-          """
+        lock(resource: "tfstate-${params.ENVIRONMENT}") {
+          unstash 'tf-plan-bundle'
+          sh '''
+            bash -lc "set -euo pipefail
+            cd \\"$TF_DIR\\"
+            export TF_PLUGIN_CACHE_DIR=\\"$TF_PLUGIN_CACHE_DIR\\"
+            terraform init -lock-timeout=5m -backend-config=\\"key=$TF_ENV/terraform.tfstate\\"
+            terraform apply -auto-approve -lock-timeout=5m plan.tfplan"
+          '''
         }
       }
     }
 
-    stage('Terraform Destroy') {
+    stage('Destroy') {
       when { expression { params.ACTION == 'destroy' } }
       steps {
-        withAwsOrStaticCreds(AWS_REGION, params.ASSUME_ROLE_ARN) {
-          sh """
-            cd "${TF_DIR}"
-            terraform init -backend-config="key=${TF_ENV}/terraform.tfstate"
-            terraform destroy -auto-approve -lock=false
-          """
+        lock(resource: "tfstate-${params.ENVIRONMENT}") {
+          sh '''
+            bash -lc "set -euo pipefail
+            cd \\"$TF_DIR\\"
+            export TF_PLUGIN_CACHE_DIR=\\"$TF_PLUGIN_CACHE_DIR\\"
+            terraform init -lock-timeout=5m -backend-config=\\"key=$TF_ENV/terraform.tfstate\\"
+            terraform destroy -auto-approve -lock-timeout=5m -var-file=\\"$TF_ENV.tfvars\\""
+          '''
         }
       }
     }
   }
 
   post {
-    success {
-      echo "✅ Success: ${params.ACTION} for ${params.ENVIRONMENT} in ${params.REGION}"
-    }
-    failure {
-      echo "❌ Failed: ${params.ACTION} for ${params.ENVIRONMENT} in ${params.REGION}"
-    }
-    always {
-      cleanWs(deleteDirs: true, notFailBuild: true)
-    }
-  }
-}
-
-/* =======================
-   Shared helper for creds
-   ======================= */
-def withAwsOrStaticCreds(String region, String roleArn, Closure body) {
-  // Option A (recommended): AssumeRole via AWS Steps plugin if ASSUME_ROLE_ARN provided.
-  if (roleArn?.trim()) {
-    withAWS(region: region, role: roleArn, duration: 3600) { body() }
-    return
-  }
-
-  // Option B (static keys): Bind a Jenkins credential (type "AWS Credentials") with ID 'aws-static-creds'.
-  // Create it in Jenkins » Manage Credentials. This mirrors GitHub secrets usage.
-  withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-static-creds']]) {
-    withEnv(["AWS_REGION=${region}"]) { body() }
+    success { echo "✅ ${params.ACTION} for ${params.ENVIRONMENT} in ${params.REGION} succeeded." }
+    failure { echo "❌ ${params.ACTION} for ${params.ENVIRONMENT} in ${params.REGION} failed." }
+    always  { cleanWs(deleteDirs: true, notFailBuild: true) }
   }
 }
