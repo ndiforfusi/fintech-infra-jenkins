@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ===== VERSIONS / VARS =====
-MAVEN_VERSION="3.9.10"
+MAVEN_VERSION="3.9.11"
 SONARQUBE_VERSION="10.5.1.90531"
 POSTGRES_USER="ddsonar"
 POSTGRES_DB="ddsonarqube"
@@ -17,6 +17,22 @@ trap 'echo " ERROR at line $LINENO"; exit 1' ERR
 echo "=========================================="
 echo "  Starting SonarQube & dependencies setup"
 echo "=========================================="
+
+# ===== Clean any stale PostgreSQL PGDG repo =====
+echo "=== Cleaning any stale PostgreSQL PGDG repo entries ==="
+if [ -f /etc/apt/sources.list.d/pgdg.list ]; then
+  echo "Removing /etc/apt/sources.list.d/pgdg.list"
+  sudo rm -f /etc/apt/sources.list.d/pgdg.list
+fi
+
+# Remove any direct references in the main sources.list
+sudo sed -i '/apt\.postgresql\.org\/pub\/repos\/apt/d' /etc/apt/sources.list || true
+
+# Also clean from any other *.list files if present
+for f in /etc/apt/sources.list.d/*.list; do
+  [ -f "$f" ] || continue
+  sudo sed -i '/apt\.postgresql\.org\/pub\/repos\/apt/d' "$f" || true
+done
 
 echo "=== Updating system packages ==="
 sudo apt-get update -y
@@ -94,12 +110,9 @@ ${SONAR_USER} hard nproc  4096
 EOF
 
 # ===== PostgreSQL =====
-echo "=== Installing PostgreSQL ==="
+echo "=== Installing PostgreSQL (Ubuntu repo) ==="
 if ! command -v psql &>/dev/null; then
-  wget -qO - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
-  echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
-    | sudo tee /etc/apt/sources.list.d/pgdg.list
-  sudo apt-get update -y
+  echo "Using default Ubuntu PostgreSQL packages..."
   sudo apt-get install -y postgresql postgresql-contrib
 else
   echo "PostgreSQL already installed."
@@ -151,7 +164,7 @@ echo "=== Creating systemd unit for SonarQube ==="
 sudo tee /etc/systemd/system/sonar.service >/dev/null <<EOF
 [Unit]
 Description=SonarQube service
-After=network.target
+After=network.target postgresql.service
 
 [Service]
 Type=forking
@@ -172,7 +185,6 @@ EOF
 
 echo "=== Reloading systemd & (re)starting service ==="
 sudo systemctl daemon-reload
-# In case a prior start-limit was hit:
 sudo systemctl reset-failed sonar || true
 sudo systemctl enable sonar
 sudo systemctl restart sonar
@@ -186,10 +198,79 @@ echo "  journalctl -u sonar -f"
 echo "Or:"
 echo "  tail -n +1 -f ${SONAR_DIR}/logs/{sonar.log,es.log,web.log,ce.log}"
 
-# ----- Optional tools -----
-install_kubectl
-install_aws_cli
-install_maven
+
+### Docker cleanup & install
+echo "Removing older Docker versions if installed..."
+sudo apt-get remove -y docker docker-engine docker.io containerd runc || true
+
+echo "Installing Docker dependencies..."
+sudo apt-get install -y \
+  apt-transport-https \
+  ca-certificates \
+  curl \
+  gnupg \
+  lsb-release
+
+echo "Adding Docker’s official GPG key..."
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+
+echo "Configuring Docker stable repository..."
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] \
+  https://download.docker.com/linux/ubuntu \
+  $(lsb_release -cs) stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+echo "Updating package index for Docker..."
+sudo apt-get update -y
+
+echo "Installing Docker Engine..."
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+
+echo "Enabling and starting Docker service..."
+sudo systemctl enable docker
+sudo systemctl start docker
+
+echo "Adding current user ($USER) to the Docker group..."
+sudo usermod -aG docker ubuntu
+newgrp docker
+echo "Docker installation complete."
+
+# Install Maven prerequisites
+sudo apt update
+sudo apt install -y wget tar git openjdk-17-jdk
+
+#Java installation
+echo "Installing java packages........"
+sudo apt-get update -y
+sudo apt-get install openjdk-21-jdk -y
+
+
+# Define Maven version
+MAVEN_VERSION=3.9.11
+MAVEN_DIR=/opt/maven
+MAVEN_ARCHIVE=apache-maven-$MAVEN_VERSION-bin.tar.gz
+             
+# Download and extract Maven
+wget https://dlcdn.apache.org/maven/maven-3/$MAVEN_VERSION/binaries/$MAVEN_ARCHIVE -P /tmp
+    
+sudo mkdir -p $MAVEN_DIR
+sudo tar -xzf /tmp/$MAVEN_ARCHIVE -C $MAVEN_DIR
+
+
+# Set environment variables
+echo "export M2_HOME=/opt/maven/apache-maven-3.9.11" | sudo tee /etc/profile.d/maven.sh
+echo "export PATH=\$M2_HOME/bin:\$PATH" | sudo tee -a /etc/profile.d/maven.sh
+
+# Apply env vars immediately
+source /etc/profile.d/maven.sh
+
+#Install kustomize 
+curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+sudo mv kustomize /usr/local/bin/
+
+
 
 echo "ALL DONE! Access SonarQube at:  http://<server-ip>:9000"
 echo "If you changed network exposure, ensure port 9000 is open in your firewall/SG."
