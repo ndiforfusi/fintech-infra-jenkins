@@ -11,7 +11,7 @@ variable "aws_account_id" {
 variable "aws_region" {
   description = "AWS Region used for deployments"
   type        = string
-  default     = "us-east-2"
+  default     = "us-west-2"
 }
 
 variable "main_region" {
